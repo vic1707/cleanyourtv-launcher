@@ -1,0 +1,20 @@
+{
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+	"customManagers": [
+		{
+			"customType": "regex",
+			"managerFilePatterns": ["/^\\.github/workflows/build\\.yml$/"],
+			"matchStrings": [
+				"# renovate: datasource=(?<datasource>[\\w.-]+) depName=(?<depName>[^\\s]+)(?: extractVersion=(?<extractVersion>[^\\n]+))?\\n\\s+\\w+: \"(?<currentValue>[^\"]+)\""
+			]
+		}
+	],
+	"packageRules": [
+		{
+			"description": "A merged bump builds and releases that version",
+			"matchDepNames": ["Gathin23/cleanyourtv"],
+			"automerge": true
+		}
+	]
+}

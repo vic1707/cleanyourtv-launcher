@@ -1,0 +1,113 @@
+name: Build launcher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # renovate: datasource=github-releases depName=Gathin23/cleanyourtv extractVersion=^v(?<version>\d+\.\d+\.\d+)$
+  CLEANYOURTV_VERSION: "3.4.0"
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Create the release
+      id-token: write # Sign the build provenance
+      attestations: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Skip versions already released
+        id: released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$CLEANYOURTV_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$CLEANYOURTV_VERSION is already released"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream
+        if: steps.released.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Gathin23/cleanyourtv
+          ref: v${{ env.CLEANYOURTV_VERSION }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Set up JDK
+        if: steps.released.outputs.skip != 'true'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        if: steps.released.outputs.skip != 'true'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build
+        if: steps.released.outputs.skip != 'true'
+        working-directory: upstream/launcher
+        run: ./gradlew --no-daemon --console=plain assembleRelease
+
+      - name: Sign
+        if: steps.released.outputs.skip != 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+        run: |
+          keystore="$RUNNER_TEMP/release.p12"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$keystore"
+          apksigner="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          apk="cleanyourtv-launcher-$CLEANYOURTV_VERSION.apk"
+          # Replaces the upstream debug signature with this repository's key.
+          "$apksigner" sign --ks "$keystore" --ks-pass env:KEYSTORE_PASSWORD \
+            --out "$apk" upstream/launcher/app/build/outputs/apk/release/app-release.apk
+          "$apksigner" verify --print-certs "$apk" | tee certificate.txt
+          sha256sum "$apk" > "$apk.sha256"
+
+      - name: Attest build provenance
+        if: steps.released.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: cleanyourtv-launcher-${{ env.CLEANYOURTV_VERSION }}.apk
+
+      - name: Release
+        if: steps.released.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk="cleanyourtv-launcher-$CLEANYOURTV_VERSION.apk"
+          upstream=$(git -C upstream rev-parse HEAD)
+          {
+            echo "Unmodified build of [Gathin23/cleanyourtv v$CLEANYOURTV_VERSION](https://github.com/Gathin23/cleanyourtv/releases/tag/v$CLEANYOURTV_VERSION) (\`$upstream\`), \`launcher/\` only."
+            echo
+            echo "Verify: \`gh attestation verify $apk --repo $GITHUB_REPOSITORY\`"
+            echo
+            echo '```'
+            cat "$apk.sha256"
+            grep -E 'SHA-256 digest' certificate.txt
+            echo '```'
+          } > notes.md
+          cp upstream/LICENSE LICENSE.txt # MIT: the notice ships with every copy
+          gh release create "v$CLEANYOURTV_VERSION" "$apk" "$apk.sha256" LICENSE.txt \
+            --repo "$GITHUB_REPOSITORY" --title "v$CLEANYOURTV_VERSION" --notes-file notes.md
